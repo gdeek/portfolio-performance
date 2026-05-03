@@ -3,18 +3,28 @@ Account*
 *.csv
 !account_performance.py
 
-# Python
+# Python bytecode / caches
 __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
 .coverage
 htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Build / package output
+build/
+dist/
+*.egg-info/
 
 # Virtual environments
 venv/
 .venv/
+env/
+ENV/
 
 # Local config / secrets
 .env
 .env.*
+.pypirc
