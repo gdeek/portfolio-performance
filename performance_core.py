@@ -476,6 +476,37 @@ def actual_positions(df: pd.DataFrame, up_to_date: pd.Timestamp) -> pd.Series:
     return pos.sort_index()
 
 
+def priced_positions(df: pd.DataFrame, market_data: MarketData, up_to_date: pd.Timestamp) -> pd.Series:
+    """
+    Return positions converted to the same split-adjusted basis as Yahoo Close.
+
+    Fidelity may or may not emit a share-distribution row for a split. Pricing
+    transaction quantities directly into the price provider's split-adjusted
+    basis handles both cases and avoids double-counting distribution rows.
+    """
+    sub = df[
+        (df["Run Date"] <= up_to_date)
+        & df["Symbol"].astype(bool)
+        & (df["Type"].str.upper() != "SHARES")
+        & (~df["Action"].str.upper().str.contains("DISTRIBUTION", na=False))
+    ].copy()
+    if sub.empty:
+        return pd.Series(dtype=float)
+
+    totals: dict[str, float] = {}
+    for _, row in sub.iterrows():
+        sym = str(row["Symbol"]).strip().upper()
+        qty = float(row["Quantity"])
+        if abs(qty) < 1e-12:
+            continue
+        factor = 1.0 if sym == "SPAXX" else split_factor_after(market_data, sym, row["Run Date"])
+        totals[sym] = totals.get(sym, 0.0) + qty * factor
+
+    pos = pd.Series(totals, dtype=float)
+    pos = pos[pos.abs() > 1e-9]
+    return pos.sort_index()
+
+
 def cash_balance(df: pd.DataFrame, up_to_date: pd.Timestamp) -> float:
     sub = df[(df["Run Date"] <= up_to_date) & (df["Type"].str.upper() == "CASH")]
     return float(sub["Amount"].sum()) if not sub.empty else 0.0
@@ -496,21 +527,23 @@ def split_factor_after(market_data: MarketData, symbol: str, date: pd.Timestamp)
 def compute_valuation(df: pd.DataFrame, market_data: MarketData, date: pd.Timestamp) -> Valuation:
     date = date.normalize()
     positions = actual_positions(df, date)
+    adjusted_positions = priced_positions(df, market_data, date)
     free_cash = cash_balance(df, date)
     security_value = 0.0
     spaxx_value = 0.0
     position_values: list[PositionValue] = []
 
-    for sym, qty in positions.items():
-        qty = float(qty)
+    for sym in sorted(set(positions.index) | set(adjusted_positions.index)):
+        qty = float(positions.get(sym, 0.0))
+        priced_qty = float(adjusted_positions.get(sym, qty))
         if sym == "SPAXX":
-            value = qty
+            priced_qty = qty
+            value = priced_qty
             spaxx_value += value
-            position_values.append(PositionValue(sym, qty, 1.0, qty, 1.0, value))
+            position_values.append(PositionValue(sym, qty, 1.0, priced_qty, 1.0, value))
             continue
 
-        factor = split_factor_after(market_data, sym, date)
-        priced_qty = qty * factor
+        factor = priced_qty / qty if abs(qty) > 1e-12 else 1.0
         price = get_price(market_data, sym, date)
         value = priced_qty * price
         security_value += value
@@ -631,6 +664,12 @@ def validate_share_actions(df: pd.DataFrame, market_data: MarketData, end: pd.Ti
         tolerance = max(SPLIT_TOLERANCE_ABS, abs(expected_distribution) * SPLIT_TOLERANCE_REL)
 
         if abs(expected_distribution) > tolerance or abs(actual_distribution) > tolerance:
+            if abs(actual_distribution) <= tolerance:
+                messages.append(
+                    f"{sym} {ratio:g}-for-1 split on {split_date.date()} has no Fidelity "
+                    "distribution row; valuation uses split-adjusted transaction quantities."
+                )
+                continue
             if abs(actual_distribution - expected_distribution) > tolerance:
                 raise PerformanceError(
                     f"Split mismatch for {sym} on {split_date.date()}: Yahoo ratio {ratio:g} "

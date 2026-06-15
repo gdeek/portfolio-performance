@@ -169,6 +169,24 @@ Date downloaded 01/03/2025
         with self.assertRaises(PerformanceError):
             validate_share_actions(df, market({"XYZ": {"2025-03-01": 100}}), pd.Timestamp("2025-03-01"))
 
+    def test_missing_split_distribution_is_synthesized_for_valuation(self):
+        df = frame(
+            [
+                row("2026-05-29", "YOU BOUGHT KLA CORP COM NEW (KLAC) (Cash)", "KLAC", price=1900, quantity=0.338, amount=-642.2),
+            ]
+        )
+        md = market(
+            {"KLAC": {"2026-06-15": 200}},
+            {"KLAC": {"2026-06-12": 10}},
+            basis_end="2026-06-15",
+        )
+        messages = validate_share_actions(df, md, pd.Timestamp("2026-06-15"))
+        self.assertIn("no Fidelity distribution row", messages[0])
+        valuation = compute_valuation(df, md, pd.Timestamp("2026-06-15"))
+        self.assertClose(valuation.position_values[0].quantity, 0.338)
+        self.assertClose(valuation.position_values[0].priced_quantity, 3.38)
+        self.assertClose(valuation.security_value, 676)
+
     def test_unclassified_nonzero_cash_stops(self):
         df = frame([row("2025-01-02", "MYSTERY CASH EVENT", amount=5)])
         with self.assertRaises(UnsupportedTransactionError):
