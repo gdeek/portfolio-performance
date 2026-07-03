@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -10,9 +13,11 @@ from performance_core import (
     PerformanceError,
     UnsupportedTransactionError,
     actual_positions,
+    clear_yahoo_download_cache,
     clean_fidelity_history,
     compute_twr,
     compute_valuation,
+    download_market_data,
     external_flows,
     merge_history_files,
     validate_cash_classification,
@@ -225,6 +230,183 @@ Date downloaded 01/03/2025
         )
         self.assertClose(actual_positions(df, pd.Timestamp("2025-01-02")).get("NFLX"), 1)
         self.assertClose(actual_positions(df, pd.Timestamp("2025-11-17")).get("NFLX"), 10)
+
+    def test_yahoo_downloads_use_disk_cache_across_memory_clears(self):
+        clear_yahoo_download_cache()
+        data = pd.DataFrame(
+            {
+                "Close": [100.0, 101.0],
+                "Stock Splits": [0.0, 0.0],
+            },
+            index=pd.to_datetime(["2026-01-02", "2026-01-03"]),
+        )
+
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                with patch("performance_core.time.time", side_effect=[0.0, 0.0, 3599.0]):
+                    with patch("performance_core.yf.download", return_value=data.copy()) as mock_download:
+                        first = download_market_data(
+                            ["ABC"], pd.Timestamp("2026-01-01"), pd.Timestamp("2026-01-03"), cache_dir=tmp
+                        )
+                        clear_yahoo_download_cache()
+                        second = download_market_data(
+                            ["ABC"], pd.Timestamp("2026-01-01"), pd.Timestamp("2026-01-03"), cache_dir=tmp
+                        )
+
+            self.assertEqual(mock_download.call_count, 1)
+            self.assertClose(first.prices.loc[pd.Timestamp("2026-01-03"), "ABC"], 101.0)
+            self.assertClose(second.prices.loc[pd.Timestamp("2026-01-03"), "ABC"], 101.0)
+        finally:
+            clear_yahoo_download_cache()
+
+    def test_yahoo_disk_cache_expires_after_one_hour(self):
+        clear_yahoo_download_cache()
+        first_data = pd.DataFrame(
+            {
+                "Close": [100.0, 101.0],
+                "Stock Splits": [0.0, 0.0],
+            },
+            index=pd.to_datetime(["2026-01-02", "2026-01-03"]),
+        )
+        refreshed_data = pd.DataFrame(
+            {
+                "Close": [200.0, 201.0],
+                "Stock Splits": [0.0, 0.0],
+            },
+            index=pd.to_datetime(["2026-01-02", "2026-01-03"]),
+        )
+
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                with patch("performance_core.time.time", side_effect=[0.0, 0.0, 3599.0, 3600.0, 3600.0]):
+                    with patch("performance_core.yf.download", side_effect=[first_data.copy(), refreshed_data.copy()]) as mock_download:
+                        first = download_market_data(
+                            ["ABC"], pd.Timestamp("2026-01-01"), pd.Timestamp("2026-01-03"), cache_dir=tmp
+                        )
+                        clear_yahoo_download_cache()
+                        second = download_market_data(
+                            ["ABC"], pd.Timestamp("2026-01-01"), pd.Timestamp("2026-01-03"), cache_dir=tmp
+                        )
+                        clear_yahoo_download_cache()
+                        third = download_market_data(
+                            ["ABC"], pd.Timestamp("2026-01-01"), pd.Timestamp("2026-01-03"), cache_dir=tmp
+                        )
+
+            self.assertEqual(mock_download.call_count, 2)
+            self.assertClose(first.prices.loc[pd.Timestamp("2026-01-03"), "ABC"], 101.0)
+            self.assertClose(second.prices.loc[pd.Timestamp("2026-01-03"), "ABC"], 101.0)
+            self.assertClose(third.prices.loc[pd.Timestamp("2026-01-03"), "ABC"], 201.0)
+        finally:
+            clear_yahoo_download_cache()
+
+    def test_refresh_prices_bypasses_valid_yahoo_disk_cache(self):
+        clear_yahoo_download_cache()
+        first_data = pd.DataFrame(
+            {
+                "Close": [100.0, 101.0],
+                "Stock Splits": [0.0, 0.0],
+            },
+            index=pd.to_datetime(["2026-01-02", "2026-01-03"]),
+        )
+        refreshed_data = pd.DataFrame(
+            {
+                "Close": [200.0, 201.0],
+                "Stock Splits": [0.0, 0.0],
+            },
+            index=pd.to_datetime(["2026-01-02", "2026-01-03"]),
+        )
+
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                with patch("performance_core.time.time", side_effect=[0.0, 0.0, 10.0, 10.0, 20.0]):
+                    with patch("performance_core.yf.download", side_effect=[first_data.copy(), refreshed_data.copy()]) as mock_download:
+                        first = download_market_data(
+                            ["ABC"], pd.Timestamp("2026-01-01"), pd.Timestamp("2026-01-03"), cache_dir=tmp
+                        )
+                        clear_yahoo_download_cache()
+                        refreshed = download_market_data(
+                            ["ABC"],
+                            pd.Timestamp("2026-01-01"),
+                            pd.Timestamp("2026-01-03"),
+                            refresh_prices=True,
+                            cache_dir=tmp,
+                        )
+                        clear_yahoo_download_cache()
+                        cached_refresh = download_market_data(
+                            ["ABC"], pd.Timestamp("2026-01-01"), pd.Timestamp("2026-01-03"), cache_dir=tmp
+                        )
+
+            self.assertEqual(mock_download.call_count, 2)
+            self.assertClose(first.prices.loc[pd.Timestamp("2026-01-03"), "ABC"], 101.0)
+            self.assertClose(refreshed.prices.loc[pd.Timestamp("2026-01-03"), "ABC"], 201.0)
+            self.assertClose(cached_refresh.prices.loc[pd.Timestamp("2026-01-03"), "ABC"], 201.0)
+        finally:
+            clear_yahoo_download_cache()
+
+    def test_corrupt_yahoo_disk_cache_falls_back_to_download(self):
+        clear_yahoo_download_cache()
+        first_data = pd.DataFrame(
+            {
+                "Close": [100.0, 101.0],
+                "Stock Splits": [0.0, 0.0],
+            },
+            index=pd.to_datetime(["2026-01-02", "2026-01-03"]),
+        )
+        refreshed_data = pd.DataFrame(
+            {
+                "Close": [200.0, 201.0],
+                "Stock Splits": [0.0, 0.0],
+            },
+            index=pd.to_datetime(["2026-01-02", "2026-01-03"]),
+        )
+
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                with patch("performance_core.time.time", side_effect=[0.0, 0.0, 10.0, 10.0]):
+                    with patch("performance_core.yf.download", side_effect=[first_data.copy(), refreshed_data.copy()]) as mock_download:
+                        first = download_market_data(
+                            ["ABC"], pd.Timestamp("2026-01-01"), pd.Timestamp("2026-01-03"), cache_dir=tmp
+                        )
+                        metadata_files = list(Path(tmp).glob("*.json"))
+                        self.assertEqual(len(metadata_files), 1)
+                        metadata_files[0].write_text("{invalid json", encoding="utf-8")
+                        clear_yahoo_download_cache()
+                        second = download_market_data(
+                            ["ABC"], pd.Timestamp("2026-01-01"), pd.Timestamp("2026-01-03"), cache_dir=tmp
+                        )
+
+            self.assertEqual(mock_download.call_count, 2)
+            self.assertClose(first.prices.loc[pd.Timestamp("2026-01-03"), "ABC"], 101.0)
+            self.assertClose(second.prices.loc[pd.Timestamp("2026-01-03"), "ABC"], 201.0)
+        finally:
+            clear_yahoo_download_cache()
+
+    def test_cached_yahoo_data_is_copied(self):
+        clear_yahoo_download_cache()
+        data = pd.DataFrame(
+            {
+                "Close": [100.0],
+                "Stock Splits": [0.0],
+            },
+            index=pd.to_datetime(["2026-01-03"]),
+        )
+
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                with patch("performance_core.time.time", side_effect=[0.0, 0.0, 10.0]):
+                    with patch("performance_core.yf.download", return_value=data.copy()) as mock_download:
+                        first = download_market_data(
+                            ["ABC"], pd.Timestamp("2026-01-01"), pd.Timestamp("2026-01-03"), cache_dir=tmp
+                        )
+                        first.prices.loc[pd.Timestamp("2026-01-03"), "ABC"] = 999.0
+                        second = download_market_data(
+                            ["ABC"], pd.Timestamp("2026-01-01"), pd.Timestamp("2026-01-03"), cache_dir=tmp
+                        )
+
+            self.assertEqual(mock_download.call_count, 1)
+            self.assertClose(second.prices.loc[pd.Timestamp("2026-01-03"), "ABC"], 100.0)
+        finally:
+            clear_yahoo_download_cache()
 
 
 if __name__ == "__main__":

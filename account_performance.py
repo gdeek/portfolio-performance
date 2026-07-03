@@ -44,6 +44,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Show holdings, cash, external-flow, and split-adjustment details.",
     )
+    parser.add_argument(
+        "--refresh-prices",
+        action="store_true",
+        help="Ignore cached Yahoo prices and download fresh data.",
+    )
     return parser.parse_args()
 
 
@@ -134,6 +139,7 @@ def main() -> int:
             holdings_csv=args.holdings_csv,
             expected_cash=args.expected_cash,
             expected_value=args.expected_value,
+            refresh_prices=args.refresh_prices,
         )
         print_result(result, args.details)
         return 0

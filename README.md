@@ -18,7 +18,7 @@ Future plans include a UI and support for other brokerages, including Robinhood.
 
 ### 1. Export your Fidelity account history
 
-Download your Fidelity account history CSV files. For the most accurate results, use complete transaction history from account inception through the end date you want to analyze.
+Download your Fidelity account history CSV files (from `Accounts & Trade` > `Portfolio` > `Activity & Orders` > filter `Orders` + `Transfer` + `Dividends/Interest` and a custom time-range). This will download a file `Accounts_History.csv`. For the most accurate results, use complete transaction history from account inception through the end date you want to analyze.
 
 If Fidelity only gives you partial downloads, merge the latest export with your existing historical exports before running performance.
 

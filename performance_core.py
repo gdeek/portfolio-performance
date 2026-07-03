@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import json
 import math
 import pathlib
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Callable, Iterable
@@ -98,6 +101,14 @@ SPLIT_TOLERANCE_ABS = 0.01
 SPLIT_TOLERANCE_REL = 0.005
 VALUE_TOLERANCE_ABS = 1.00
 VALUE_TOLERANCE_REL = 0.0005
+YAHOO_DOWNLOAD_CACHE_TTL_SECONDS = 60 * 60
+YAHOO_DOWNLOAD_CACHE_VERSION = 1
+YAHOO_DOWNLOAD_AUTO_ADJUST = False
+YAHOO_DOWNLOAD_ACTIONS = True
+
+_YahooDownloadCacheKey = tuple[str, str, str, bool, bool, int]
+_YahooDownloadCacheEntry = tuple[float, pd.DataFrame]
+_YAHOO_DOWNLOAD_CACHE: dict[_YahooDownloadCacheKey, _YahooDownloadCacheEntry] = {}
 
 
 class PerformanceError(RuntimeError):
@@ -389,11 +400,163 @@ def extract_yfinance_series(data: pd.DataFrame, field: str, symbol: str) -> pd.S
     return None
 
 
+def clear_yahoo_download_cache() -> None:
+    _YAHOO_DOWNLOAD_CACHE.clear()
+
+
+def yahoo_download_cache_dir() -> pathlib.Path:
+    return pathlib.Path.home() / ".cache" / "fidelity-portfolio-tracker" / "yahoo"
+
+
+def yahoo_download_cache_key(
+    symbol: str,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> _YahooDownloadCacheKey:
+    return (
+        symbol,
+        start.strftime("%Y-%m-%d"),
+        end.strftime("%Y-%m-%d"),
+        YAHOO_DOWNLOAD_AUTO_ADJUST,
+        YAHOO_DOWNLOAD_ACTIONS,
+        YAHOO_DOWNLOAD_CACHE_VERSION,
+    )
+
+
+def yahoo_download_cache_paths(
+    cache_key: _YahooDownloadCacheKey,
+    cache_dir: str | pathlib.Path | None = None,
+) -> tuple[pathlib.Path, pathlib.Path]:
+    symbol, start, end, auto_adjust, actions, version = cache_key
+    payload = {
+        "actions": actions,
+        "auto_adjust": auto_adjust,
+        "end": end,
+        "start": start,
+        "symbol": symbol,
+        "version": version,
+    }
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    safe_symbol = re.sub(r"[^A-Z0-9._-]+", "_", symbol.upper()).strip("_") or "SYMBOL"
+    stem = f"{safe_symbol}_{start}_{end}_{digest}"
+    root = pathlib.Path(cache_dir).expanduser() if cache_dir is not None else yahoo_download_cache_dir()
+    return root / f"{stem}.pkl", root / f"{stem}.json"
+
+
+def read_yahoo_disk_cache(
+    cache_key: _YahooDownloadCacheKey,
+    now: float,
+    cache_dir: str | pathlib.Path | None = None,
+) -> pd.DataFrame | None:
+    data_path, metadata_path = yahoo_download_cache_paths(cache_key, cache_dir)
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        fetched_at = float(metadata["fetched_at"])
+        if metadata.get("version") != YAHOO_DOWNLOAD_CACHE_VERSION:
+            return None
+        if now - fetched_at >= YAHOO_DOWNLOAD_CACHE_TTL_SECONDS:
+            return None
+        if (
+            metadata.get("symbol"),
+            metadata.get("start"),
+            metadata.get("end"),
+            metadata.get("auto_adjust"),
+            metadata.get("actions"),
+            metadata.get("version"),
+        ) != cache_key:
+            return None
+
+        data = pd.read_pickle(data_path)
+        if not isinstance(data, pd.DataFrame):
+            return None
+    except Exception:
+        return None
+
+    _YAHOO_DOWNLOAD_CACHE[cache_key] = (fetched_at, data.copy(deep=True))
+    return data.copy(deep=True)
+
+
+def write_yahoo_disk_cache(
+    cache_key: _YahooDownloadCacheKey,
+    data: pd.DataFrame,
+    fetched_at: float,
+    cache_dir: str | pathlib.Path | None = None,
+) -> None:
+    data_path, metadata_path = yahoo_download_cache_paths(cache_key, cache_dir)
+    metadata = {
+        "actions": cache_key[4],
+        "auto_adjust": cache_key[3],
+        "end": cache_key[2],
+        "fetched_at": fetched_at,
+        "start": cache_key[1],
+        "symbol": cache_key[0],
+        "version": cache_key[5],
+    }
+    data_tmp = data_path.with_name(f"{data_path.name}.{time.time_ns()}.tmp")
+    metadata_tmp = metadata_path.with_name(f"{metadata_path.name}.{time.time_ns()}.tmp")
+
+    try:
+        data_path.parent.mkdir(parents=True, exist_ok=True)
+        data.to_pickle(data_tmp)
+        metadata_tmp.write_text(json.dumps(metadata, sort_keys=True), encoding="utf-8")
+        data_tmp.replace(data_path)
+        metadata_tmp.replace(metadata_path)
+    except Exception:
+        try:
+            data_tmp.unlink(missing_ok=True)
+            metadata_tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def download_yahoo_data(
+    symbol: str,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    refresh_prices: bool = False,
+    cache_dir: str | pathlib.Path | None = None,
+) -> pd.DataFrame:
+    symbol = str(symbol).strip().upper()
+    start = pd.Timestamp(start).normalize()
+    end = pd.Timestamp(end).normalize()
+    cache_key = yahoo_download_cache_key(symbol, start, end)
+    now = time.time()
+
+    if not refresh_prices:
+        cached = _YAHOO_DOWNLOAD_CACHE.get(cache_key)
+        if cached is not None:
+            fetched_at, data = cached
+            if now - fetched_at < YAHOO_DOWNLOAD_CACHE_TTL_SECONDS:
+                return data.copy(deep=True)
+            del _YAHOO_DOWNLOAD_CACHE[cache_key]
+
+        cached_data = read_yahoo_disk_cache(cache_key, now, cache_dir)
+        if cached_data is not None:
+            return cached_data
+
+    data = yf.download(
+        symbol,
+        start=start,
+        end=end,
+        progress=False,
+        auto_adjust=YAHOO_DOWNLOAD_AUTO_ADJUST,
+        actions=YAHOO_DOWNLOAD_ACTIONS,
+    )
+    if not data.empty:
+        fetched_at = time.time()
+        cached_copy = data.copy(deep=True)
+        _YAHOO_DOWNLOAD_CACHE[cache_key] = (fetched_at, cached_copy)
+        write_yahoo_disk_cache(cache_key, cached_copy, fetched_at, cache_dir)
+    return data
+
+
 def download_market_data(
     symbols: Iterable[str],
     earliest_date: pd.Timestamp,
     end: pd.Timestamp,
     max_retries: int = 3,
+    refresh_prices: bool = False,
+    cache_dir: str | pathlib.Path | None = None,
 ) -> MarketData:
     symbols = list(symbols)
     if not symbols:
@@ -411,13 +574,12 @@ def download_market_data(
         last_err = None
         for _ in range(max_retries):
             try:
-                data = yf.download(
+                data = download_yahoo_data(
                     sym,
-                    start=start_dl,
-                    end=end_dl,
-                    progress=False,
-                    auto_adjust=False,
-                    actions=True,
+                    start_dl,
+                    end_dl,
+                    refresh_prices=refresh_prices,
+                    cache_dir=cache_dir,
                 )
                 close = extract_yfinance_series(data, "Close", sym)
                 if close is None or close.dropna().empty:
@@ -790,6 +952,96 @@ def build_xirr_cashflows(
     return cfs, dates
 
 
+def cumulative_deltas_on_dates(deltas: pd.Series, dates: pd.DatetimeIndex) -> pd.Series:
+    if deltas.empty:
+        return pd.Series(0.0, index=dates)
+
+    deltas = deltas.groupby(deltas.index).sum().sort_index()
+    combined_index = deltas.index.union(dates).sort_values()
+    return (
+        deltas.reindex(combined_index, fill_value=0.0)
+        .cumsum()
+        .reindex(dates)
+        .fillna(0.0)
+        .astype(float)
+    )
+
+
+def total_value_series(df: pd.DataFrame, market_data: MarketData, dates: pd.DatetimeIndex) -> pd.Series:
+    dates = pd.DatetimeIndex(pd.to_datetime(dates)).normalize().drop_duplicates().sort_values()
+    if dates.empty:
+        return pd.Series(dtype=float)
+
+    end = dates.max()
+    run_dates = pd.to_datetime(df["Run Date"]).dt.normalize()
+    symbols = df["Symbol"].fillna("").astype(str).str.strip().str.upper()
+    types = df["Type"].fillna("").astype(str).str.upper()
+    actions = df["Action"].fillna("").astype(str).str.upper()
+
+    cash_mask = (run_dates <= end) & (types == "CASH")
+    cash_deltas = df.loc[cash_mask].groupby(run_dates[cash_mask])["Amount"].sum()
+    free_cash = cumulative_deltas_on_dates(cash_deltas, dates)
+
+    spaxx_mask = (run_dates <= end) & (symbols == "SPAXX")
+    spaxx_deltas = df.loc[spaxx_mask].groupby(run_dates[spaxx_mask])["Quantity"].sum()
+    spaxx_value = cumulative_deltas_on_dates(spaxx_deltas, dates)
+
+    priced_mask = (
+        (run_dates <= end)
+        & symbols.astype(bool)
+        & (symbols != "SPAXX")
+        & (types != "SHARES")
+        & (~actions.str.contains("DISTRIBUTION", na=False))
+    )
+    security_value = pd.Series(0.0, index=dates)
+    if priced_mask.any():
+        priced_rows = df.loc[priced_mask, ["Run Date", "Quantity"]].copy()
+        priced_rows["Run Date"] = run_dates[priced_mask].values
+        priced_rows["Symbol"] = symbols[priced_mask].values
+        priced_rows["Adjusted Quantity"] = [
+            float(quantity) * split_factor_after(market_data, symbol, date)
+            for symbol, date, quantity in zip(
+                priced_rows["Symbol"],
+                priced_rows["Run Date"],
+                priced_rows["Quantity"],
+            )
+        ]
+
+        quantity_deltas = (
+            priced_rows.groupby(["Run Date", "Symbol"])["Adjusted Quantity"]
+            .sum()
+            .unstack(fill_value=0.0)
+            .sort_index()
+        )
+        combined_index = quantity_deltas.index.union(dates).sort_values()
+        quantities = (
+            quantity_deltas.reindex(combined_index, fill_value=0.0)
+            .cumsum()
+            .reindex(dates)
+            .fillna(0.0)
+        )
+        active_symbols = [sym for sym in quantities.columns if quantities[sym].abs().max() > 1e-9]
+
+        if active_symbols:
+            missing_symbols = [sym for sym in active_symbols if sym not in market_data.prices.columns]
+            if missing_symbols:
+                raise PerformanceError(f"No price series available for {missing_symbols[0]}")
+
+            price_index = market_data.prices.index.union(dates).sort_values()
+            prices = market_data.prices.reindex(price_index).ffill().reindex(dates)
+            active_prices = prices[active_symbols]
+            active_quantities = quantities[active_symbols]
+            missing_price = active_prices.isna() & (active_quantities.abs() > 1e-9)
+            if missing_price.any().any():
+                date = missing_price.any(axis=1).idxmax()
+                symbol = missing_price.loc[date][missing_price.loc[date]].index[0]
+                raise PerformanceError(f"No price available for {symbol} on or before {date.date()}")
+
+            security_value = (active_quantities * active_prices).sum(axis=1)
+
+    return security_value + spaxx_value + free_cash
+
+
 def compute_twr(
     df: pd.DataFrame,
     market_data: MarketData,
@@ -801,11 +1053,12 @@ def compute_twr(
         return float("nan"), float("nan")
 
     flow_by_date = flows.groupby("Run Date")["Amount"].sum() if not flows.empty else pd.Series(dtype=float)
-    prev_value = compute_valuation(df, market_data, start).total_value
+    values = total_value_series(df, market_data, pd.date_range(start, end, freq="D"))
+    prev_value = float(values.loc[start.normalize()])
     chain = 1.0
 
-    for date in pd.date_range(start + timedelta(days=1), end, freq="D"):
-        value = compute_valuation(df, market_data, date).total_value
+    for date, value in values.iloc[1:].items():
+        value = float(value)
         flow = float(flow_by_date.get(date.normalize(), 0.0))
         if abs(prev_value) < 1e-9:
             prev_value = value
@@ -876,13 +1129,22 @@ def analyze_performance(
     expected_cash: float | None = None,
     expected_value: float | None = None,
     market_loader: Callable[[Iterable[str], pd.Timestamp, pd.Timestamp], MarketData] = download_market_data,
+    refresh_prices: bool = False,
 ) -> PerformanceResult:
     start, end, label = determine_period(df, period, start_arg, end_arg)
     warnings = [
         "Assuming the transaction CSV is complete from account inception through the end date."
     ]
 
-    market_data = market_loader(symbols_for_pricing(df), df["Run Date"].min(), end)
+    if market_loader is download_market_data:
+        market_data = market_loader(
+            symbols_for_pricing(df),
+            df["Run Date"].min(),
+            end,
+            refresh_prices=refresh_prices,
+        )
+    else:
+        market_data = market_loader(symbols_for_pricing(df), df["Run Date"].min(), end)
     validate_cash_classification(df, end)
     split_messages = validate_share_actions(df, market_data, end)
     start_valuation = compute_valuation(df, market_data, start)
