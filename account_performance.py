@@ -6,8 +6,17 @@ import argparse
 import math
 import sys
 
-from benchmark_core import DEFAULT_BENCHMARKS, BenchmarkResult, simulate_benchmark
+from benchmark_core import (
+    DEFAULT_BENCHMARKS,
+    DEFAULT_BLENDS,
+    BenchmarkHolding,
+    BenchmarkResult,
+    holdings_label,
+    parse_blend,
+    simulate_allocation,
+)
 from performance_core import (
+    MarketData,
     PerformanceError,
     analyze_performance,
     download_market_data,
@@ -55,25 +64,40 @@ def parse_args() -> argparse.Namespace:
         "--benchmark",
         action="append",
         metavar="SYMBOL",
-        help="Benchmark ticker to compare against, repeatable. Defaults to QQQM.",
+        help="Benchmark ticker to compare against, repeatable. Omit benchmark flags for the defaults.",
+    )
+    parser.add_argument(
+        "--blend",
+        action="append",
+        metavar="TICKER:WEIGHT,...",
+        help="Weighted blend to compare against, e.g. QQQM:50,VTI:30,VGT:20. Repeatable.",
     )
     parser.add_argument(
         "--no-benchmark",
         action="store_true",
-        help="Skip the benchmark comparison.",
+        help="Skip all benchmark comparisons.",
     )
     return parser.parse_args()
 
 
-def requested_benchmarks(args: argparse.Namespace) -> list[str]:
+def requested_comparisons(args: argparse.Namespace) -> list[tuple[BenchmarkHolding, ...]]:
     if args.no_benchmark:
         return []
-    symbols: list[str] = []
-    for symbol in args.benchmark or DEFAULT_BENCHMARKS:
-        normalized = str(symbol).strip().upper()
-        if normalized and normalized not in symbols:
-            symbols.append(normalized)
-    return symbols
+    if args.benchmark or args.blend:
+        comparisons: list[tuple[BenchmarkHolding, ...]] = []
+        seen: set[str] = set()
+        for symbol in args.benchmark or ():
+            normalized = str(symbol).strip().upper()
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                comparisons.append((BenchmarkHolding(normalized, 1.0),))
+        for value in args.blend or ():
+            comparisons.append(parse_blend(value))
+        return comparisons
+
+    comparisons = [(BenchmarkHolding(symbol, 1.0),) for symbol in DEFAULT_BENCHMARKS]
+    comparisons.extend(tuple(blend) for blend in DEFAULT_BLENDS)
+    return comparisons
 
 
 def signed_money(value: float) -> str:
@@ -167,9 +191,10 @@ def print_benchmark_comparison(result, benchmarks: list[BenchmarkResult], detail
     for bench in benchmarks:
         buys = sum(1 for event in bench.events if event.kind == "buy")
         sells = sum(1 for event in bench.events if event.kind == "sell")
+        column = bench.label if len(bench.holdings) == 1 else "Blend"
         print()
         print(
-            f"  {bench.symbol} ({buys} purchases, {sells} sales, "
+            f"  {bench.label} ({buys} purchases, {sells} sales, "
             f"{bench.dividend_count} dividends reinvested):"
         )
         rows = (
@@ -199,12 +224,15 @@ def print_benchmark_comparison(result, benchmarks: list[BenchmarkResult], detail
                 signed_money(bench.end_value - result.end_valuation.total_value),
             ),
         )
-        print(f"    {'Metric':<12}{'Portfolio':>14}{bench.symbol:>14}{'Difference':>14}")
+        print(f"    {'Metric':<12}{'Portfolio':>14}{column:>14}{'Difference':>14}")
         for label, portfolio_value, benchmark_value, difference in rows:
             print(f"    {label:<12}{portfolio_value:>14}{benchmark_value:>14}{difference:>14}")
+        positions = ", ".join(
+            f"{symbol} {shares:,.4f}" for symbol, shares in bench.positions.items()
+        )
         print(
             f"    Dividends reinvested: {money(bench.dividends_reinvested)} "
-            f"across {bench.dividend_count} event(s), end shares {bench.shares_end:,.4f}"
+            f"across {bench.dividend_count} event(s); end shares {positions}"
         )
         for warning in bench.warnings:
             print(f"    Warning: {warning}")
@@ -212,27 +240,27 @@ def print_benchmark_comparison(result, benchmarks: list[BenchmarkResult], detail
     if details:
         for bench in benchmarks:
             dividends = [event for event in bench.events if event.kind == "dividend"]
-            splits = [event for event in bench.events if event.kind == "split"]
             print()
-            print(f"  {bench.symbol} dividend reinvestment:")
+            print(f"  {bench.label} dividend reinvestment:")
             if not dividends:
                 print("    None")
             for event in dividends:
                 held = event.shares_after - event.shares
                 print(
-                    f"    {event.date.date()} {event.dividend_per_share:.4f}/share on "
+                    f"    {event.date.date()} {event.symbol} {event.dividend_per_share:.4f}/share on "
                     f"{held:.6f} shares = {money(event.amount)} reinvested at "
                     f"{money(event.price)} (+{event.shares:.6f} shares)"
-                )
-            for event in splits:
-                print(
-                    f"    {event.date.date()} split x{event.shares:g}, "
-                    f"shares after {event.shares_after:.6f}"
                 )
 
 
 def main() -> int:
     args = parse_args()
+    try:
+        comparisons = requested_comparisons(args)
+    except PerformanceError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
     try:
         df = load_account_history(args.history_csv, args.account_number)
         result = analyze_performance(
@@ -252,26 +280,34 @@ def main() -> int:
 
     benchmarks: list[BenchmarkResult] = []
     failures: list[str] = []
-    for symbol in requested_benchmarks(args):
+    symbols = sorted({holding.symbol for comparison in comparisons for holding in comparison})
+    market_data: MarketData | None = None
+    if symbols:
         try:
             market_data = download_market_data(
-                [symbol],
+                symbols,
                 result.start,
                 result.end,
                 refresh_prices=args.refresh_prices,
             )
-            benchmarks.append(
-                simulate_benchmark(
-                    symbol,
-                    result.flows,
-                    result.start_valuation.total_value,
-                    result.start,
-                    result.end,
-                    market_data,
-                )
-            )
         except PerformanceError as exc:
-            failures.append(f"{symbol}: {exc}")
+            failures.append(str(exc))
+
+    if market_data is not None:
+        for comparison in comparisons:
+            try:
+                benchmarks.append(
+                    simulate_allocation(
+                        comparison,
+                        result.flows,
+                        result.start_valuation.total_value,
+                        result.start,
+                        result.end,
+                        market_data,
+                    )
+                )
+            except PerformanceError as exc:
+                failures.append(f"{holdings_label(comparison)}: {exc}")
 
     print_result(result, args.details)
     if benchmarks:

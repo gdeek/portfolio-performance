@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import math
 from pathlib import Path
 import tempfile
@@ -8,7 +9,15 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from benchmark_core import simulate_benchmark
+from account_performance import requested_comparisons
+from benchmark_core import (
+    BenchmarkHolding,
+    holdings_label,
+    normalize_holdings,
+    parse_blend,
+    simulate_allocation,
+    simulate_benchmark,
+)
 from performance_core import (
     HISTORY_COLUMNS,
     MarketData,
@@ -431,7 +440,7 @@ class BenchmarkCoreTests(unittest.TestCase):
 
         self.assertClose(result.start_value, 100.0)
         self.assertClose(result.end_value, 222.2)
-        self.assertClose(result.shares_end, 2.02)
+        self.assertClose(result.positions["QQQM"], 2.02)
         self.assertClose(result.dividends_reinvested, 2.0)
         self.assertEqual(result.dividend_count, 1)
         self.assertClose(result.pl, 22.2)
@@ -477,7 +486,7 @@ class BenchmarkCoreTests(unittest.TestCase):
         self.assertEqual(len(sells), 1)
         self.assertClose(sells[0].amount, -50.0)
         self.assertClose(sells[0].price, 110.0)
-        self.assertClose(result.shares_end, 60.0 / 110.0)
+        self.assertClose(result.positions["QQQM"], 60.0 / 110.0)
         self.assertClose(result.end_value, 60.0)
         self.assertClose(result.pl, 10.0)
         self.assertClose(result.pl_pct, 0.2)
@@ -499,22 +508,20 @@ class BenchmarkCoreTests(unittest.TestCase):
         self.assertClose(result.twr_annualized, 0.122)
         self.assertEqual(result.warnings, [])
 
-    def test_benchmark_split_adjusts_shares(self):
+    def test_benchmark_does_not_reapply_splits_to_adjusted_prices(self):
         md = market(
-            {"QQQM": {"2025-01-02": 100, "2025-01-03": 50}},
-            splits={"QQQM": {"2025-01-03": 2.0}},
-            basis_end="2025-01-03",
+            {"VGT": {"2026-04-20": 100, "2026-04-21": 101, "2026-04-22": 102}},
+            splits={"VGT": {"2026-04-21": 8.0}},
+            basis_end="2026-04-22",
         )
         result = simulate_benchmark(
-            "QQQM", pd.DataFrame(), 100.0, pd.Timestamp("2025-01-02"), pd.Timestamp("2025-01-03"), md
+            "VGT", pd.DataFrame(), 100.0, pd.Timestamp("2026-04-20"), pd.Timestamp("2026-04-22"), md
         )
 
-        self.assertClose(result.shares_end, 2.0)
-        self.assertClose(result.end_value, 100.0)
-        self.assertClose(result.twr_total, 0.0)
-        splits = [event for event in result.events if event.kind == "split"]
-        self.assertEqual(len(splits), 1)
-        self.assertClose(splits[0].shares, 2.0)
+        self.assertClose(result.positions["VGT"], 1.0)
+        self.assertClose(result.end_value, 102.0)
+        self.assertClose(result.pl, 2.0)
+        self.assertEqual([event.kind for event in result.events], ["buy"])
 
     def test_benchmark_buys_on_ex_date_do_not_receive_dividend(self):
         md = market(
@@ -526,7 +533,7 @@ class BenchmarkCoreTests(unittest.TestCase):
             "QQQM", pd.DataFrame(), 100.0, pd.Timestamp("2025-01-06"), pd.Timestamp("2025-01-07"), md
         )
 
-        self.assertClose(result.shares_end, 1.0)
+        self.assertClose(result.positions["QQQM"], 1.0)
         self.assertClose(result.dividends_reinvested, 0.0)
         self.assertEqual(result.dividend_count, 0)
         self.assertClose(result.end_value, 100.0)
@@ -578,6 +585,87 @@ class BenchmarkCoreTests(unittest.TestCase):
             self.assertEqual(len(md.dividends), 1)
         finally:
             clear_yahoo_download_cache()
+
+    def test_blend_splits_flows_and_reinvests_dividends_per_leg(self):
+        md = market(
+            {
+                "AAA": {"2025-01-02": 100, "2025-01-06": 200},
+                "BBB": {"2025-01-02": 100, "2025-01-06": 100},
+            },
+            dividends={"AAA": {"2025-01-06": 10.0}},
+            basis_end="2025-01-06",
+        )
+        holdings = (BenchmarkHolding("AAA", 75.0), BenchmarkHolding("BBB", 25.0))
+        flows = pd.DataFrame([{"Run Date": pd.Timestamp("2025-01-03"), "Amount": 100.0}])
+        result = simulate_allocation(
+            holdings, flows, 100.0, pd.Timestamp("2025-01-02"), pd.Timestamp("2025-01-06"), md
+        )
+
+        self.assertEqual(result.label, "75% AAA + 25% BBB")
+        self.assertClose(result.positions["AAA"], 1.1625)
+        self.assertClose(result.positions["BBB"], 0.5)
+        self.assertClose(result.dividends_reinvested, 7.5)
+        self.assertEqual(result.dividend_count, 1)
+        self.assertClose(result.end_value, 282.5)
+        self.assertClose(result.pl, 82.5)
+        self.assertClose(result.pl_pct, 0.4125)
+        self.assertClose(result.twr_total, 0.4125)
+
+        dividend = [event for event in result.events if event.kind == "dividend"][0]
+        self.assertEqual(dividend.symbol, "AAA")
+        self.assertClose(dividend.dividend_per_share, 10.0)
+        self.assertClose(dividend.price, 200.0)
+        self.assertClose(dividend.shares, 0.0375)
+        buys = {event.symbol: event.date for event in result.events if event.kind == "buy"}
+        self.assertEqual(
+            buys, {"AAA": pd.Timestamp("2025-01-06"), "BBB": pd.Timestamp("2025-01-06")}
+        )
+
+    def test_parse_blend_normalizes_weights(self):
+        holdings = parse_blend("qqqm:50, vti:30, vgt:20")
+        self.assertEqual(holdings_label(holdings), "50% QQQM + 30% VTI + 20% VGT")
+        self.assertClose(holdings[0].weight, 0.5)
+        self.assertClose(holdings[1].weight, 0.3)
+        self.assertClose(holdings[2].weight, 0.2)
+
+    def test_parse_blend_rejects_invalid_specs(self):
+        for spec in ("", "QQQM", "QQQM:", ":50", "QQQM:x", "QQQM:0", "QQQM:-1", "QQQM:50,,VTI:30"):
+            with self.subTest(spec=spec):
+                with self.assertRaises(PerformanceError):
+                    parse_blend(spec)
+
+    def test_normalize_holdings_combines_duplicate_symbols(self):
+        holdings = normalize_holdings(
+            (BenchmarkHolding("qqqm", 50.0), BenchmarkHolding("QQQM", 50.0))
+        )
+        self.assertEqual(len(holdings), 1)
+        self.assertEqual(holdings[0].symbol, "QQQM")
+        self.assertClose(holdings[0].weight, 1.0)
+        with self.assertRaises(PerformanceError):
+            normalize_holdings(())
+        with self.assertRaises(PerformanceError):
+            normalize_holdings((BenchmarkHolding("QQQM", 0.0),))
+        with self.assertRaises(PerformanceError):
+            normalize_holdings((BenchmarkHolding("  ", 1.0),))
+
+    def test_default_comparisons_cover_tickers_and_blend(self):
+        defaults = requested_comparisons(
+            argparse.Namespace(benchmark=None, blend=None, no_benchmark=False)
+        )
+        self.assertEqual(
+            [holdings_label(comparison) for comparison in defaults],
+            ["QQQM", "VTI", "VGT", "50% QQQM + 30% VTI + 20% VGT"],
+        )
+        explicit = requested_comparisons(
+            argparse.Namespace(benchmark=["spy"], blend=["qqqm:100"], no_benchmark=False)
+        )
+        self.assertEqual([holdings_label(comparison) for comparison in explicit], ["SPY", "QQQM"])
+        self.assertEqual(
+            requested_comparisons(
+                argparse.Namespace(benchmark=None, blend=None, no_benchmark=True)
+            ),
+            [],
+        )
 
 
 if __name__ == "__main__":

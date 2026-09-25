@@ -12,7 +12,7 @@ Future plans include a UI and support for other brokerages, including Robinhood.
 - Reconstructs holdings and cash balances from transaction history.
 - Handles SPAXX/core cash, free cash, external contributions, withdrawals, dividends, reinvestments, and stock splits.
 - Calculates XIRR and date-level approximate time-weighted CAGR.
-- Compares results against a benchmark (QQQM by default) by mirroring external cash flows and reinvesting benchmark dividends, with support for additional tickers.
+- Compares results against benchmarks (QQQM, VTI, VGT, and a 50/30/20 blend by default) by mirroring external cash flows and reinvesting benchmark dividends, with weighted blends and additional tickers supported.
 - Stops with clear errors when unsupported cash movements or corporate actions could make results unreliable.
 
 ## How to use
@@ -85,21 +85,22 @@ python account_performance.py Accounts_History_20250110_20260430.csv YOUR_ACCOUN
 
 ### 7. Compare against a benchmark
 
-Every report includes a QQQM comparison by default. It replays the same external cash flows (start-of-period value plus every contribution and withdrawal) into the benchmark, reinvests benchmark dividends, and reports the same P/L %, XIRR, and TWR CAGR next to the portfolio's.
+Every report compares against QQQM, VTI, VGT, and a 50% QQQM + 30% VTI + 20% VGT blend by default. Each comparison replays the same external cash flows (start-of-period value plus every contribution and withdrawal) into the benchmark, reinvests benchmark dividends within the same holding, lets the blend drift without rebalancing, and reports the same P/L %, XIRR, and TWR CAGR next to the portfolio's.
 
-Add more tickers by repeating `--benchmark`:
+Pass `--benchmark` and/or `--blend` to replace the default set:
 
 ```bash
 python account_performance.py Accounts_History_20250110_20260430.csv YOUR_ACCOUNT_NUMBER 1Y --benchmark QQQM --benchmark SPY
+python account_performance.py Accounts_History_20250110_20260430.csv YOUR_ACCOUNT_NUMBER 1Y --blend QQQM:60,VTI:40
 ```
 
-Skip the comparison:
+Skip all comparisons:
 
 ```bash
 python account_performance.py Accounts_History_20250110_20260430.csv YOUR_ACCOUNT_NUMBER 1Y --no-benchmark
 ```
 
-Use `--details` to list each reinvested dividend with its ex-date, per-share amount, and shares added.
+Use `--details` to list each reinvested dividend with its ticker, ex-date, per-share amount, and shares added.
 
 ### 8. Run tests
 
@@ -113,4 +114,5 @@ python -m unittest -q
 - The performance script assumes the transaction CSV is complete from account inception through the end date.
 - TWR is date-level approximate because Fidelity CSV exports do not provide intraday flow timing.
 - Benchmark comparisons mirror external cash flows at the next trading day's close, reinvest dividends at the ex-dividend close (Yahoo does not expose payable dates), and assume fractional shares with no fees or taxes.
+- Blended allocations split each cash flow by the target weights and then drift; they are not rebalanced.
 - The benchmark starts with the portfolio's start-of-period value, so comparisons stay apples-to-apples for periods like YTD or 1Y.
