@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 import tempfile
 import unittest
@@ -7,6 +8,7 @@ from unittest.mock import patch
 
 import pandas as pd
 
+from benchmark_core import simulate_benchmark
 from performance_core import (
     HISTORY_COLUMNS,
     MarketData,
@@ -88,13 +90,16 @@ def frame(rows):
     return df
 
 
-def market(prices, splits=None, basis_end="2026-01-01"):
+def market(prices, splits=None, basis_end="2026-01-01", dividends=None):
     price_df = pd.DataFrame(prices)
     price_df.index = pd.to_datetime(price_df.index).normalize()
     split_df = pd.DataFrame(splits or {})
     if not split_df.empty:
         split_df.index = pd.to_datetime(split_df.index).normalize()
-    return MarketData(price_df, split_df, pd.Timestamp(basis_end))
+    dividend_df = pd.DataFrame(dividends or {})
+    if not dividend_df.empty:
+        dividend_df.index = pd.to_datetime(dividend_df.index).normalize()
+    return MarketData(price_df, split_df, pd.Timestamp(basis_end), dividend_df)
 
 
 class PerformanceCoreTests(unittest.TestCase):
@@ -405,6 +410,172 @@ Date downloaded 01/03/2025
 
             self.assertEqual(mock_download.call_count, 1)
             self.assertClose(second.prices.loc[pd.Timestamp("2026-01-03"), "ABC"], 100.0)
+        finally:
+            clear_yahoo_download_cache()
+
+
+class BenchmarkCoreTests(unittest.TestCase):
+    def assertClose(self, actual, expected, places=6):
+        self.assertAlmostEqual(actual, expected, places=places)
+
+    def test_benchmark_mirrors_flows_and_reinvests_dividends(self):
+        md = market(
+            {"QQQM": {"2025-01-02": 100, "2025-01-03": 100, "2025-01-06": 100, "2025-01-07": 110}},
+            dividends={"QQQM": {"2025-01-06": 1.0}},
+            basis_end="2025-01-07",
+        )
+        flows = pd.DataFrame([{"Run Date": pd.Timestamp("2025-01-03"), "Amount": 100.0}])
+        result = simulate_benchmark(
+            "QQQM", flows, 100.0, pd.Timestamp("2025-01-02"), pd.Timestamp("2025-01-07"), md
+        )
+
+        self.assertClose(result.start_value, 100.0)
+        self.assertClose(result.end_value, 222.2)
+        self.assertClose(result.shares_end, 2.02)
+        self.assertClose(result.dividends_reinvested, 2.0)
+        self.assertEqual(result.dividend_count, 1)
+        self.assertClose(result.pl, 22.2)
+        self.assertClose(result.pl_pct, 0.111)
+        self.assertClose(result.twr_total, 0.111)
+        self.assertGreater(result.twr_annualized, result.twr_total)
+        self.assertTrue(math.isnan(result.xirr_rate))
+        self.assertTrue(any("XIRR" in warning for warning in result.warnings))
+
+        self.assertEqual([event.kind for event in result.events], ["buy", "buy", "dividend"])
+        dividend = result.events[-1]
+        self.assertEqual(dividend.date, pd.Timestamp("2025-01-06"))
+        self.assertClose(dividend.dividend_per_share, 1.0)
+        self.assertClose(dividend.price, 100.0)
+        self.assertClose(dividend.shares, 0.02)
+
+    def test_benchmark_weekend_flow_executes_next_trading_day(self):
+        md = market(
+            {"QQQM": {"2025-01-03": 100, "2025-01-06": 100, "2025-01-07": 110}},
+            basis_end="2025-01-07",
+        )
+        flows = pd.DataFrame([{"Run Date": pd.Timestamp("2025-01-04"), "Amount": 100.0}])
+        result = simulate_benchmark(
+            "QQQM", flows, 100.0, pd.Timestamp("2025-01-03"), pd.Timestamp("2025-01-07"), md
+        )
+
+        buys = [event for event in result.events if event.kind == "buy"]
+        self.assertEqual(len(buys), 2)
+        self.assertEqual(buys[0].date, pd.Timestamp("2025-01-03"))
+        self.assertEqual(buys[1].date, pd.Timestamp("2025-01-06"))
+        self.assertClose(buys[1].amount, 100.0)
+        self.assertClose(result.end_value, 220.0)
+        self.assertClose(result.twr_total, 0.10)
+
+    def test_benchmark_withdrawal_sells_shares_at_close(self):
+        md = market({"QQQM": {"2025-01-02": 100, "2025-01-03": 110}}, basis_end="2025-01-03")
+        flows = pd.DataFrame([{"Run Date": pd.Timestamp("2025-01-03"), "Amount": -50.0}])
+        result = simulate_benchmark(
+            "QQQM", flows, 100.0, pd.Timestamp("2025-01-02"), pd.Timestamp("2025-01-03"), md
+        )
+
+        sells = [event for event in result.events if event.kind == "sell"]
+        self.assertEqual(len(sells), 1)
+        self.assertClose(sells[0].amount, -50.0)
+        self.assertClose(sells[0].price, 110.0)
+        self.assertClose(result.shares_end, 60.0 / 110.0)
+        self.assertClose(result.end_value, 60.0)
+        self.assertClose(result.pl, 10.0)
+        self.assertClose(result.pl_pct, 0.2)
+
+    def test_benchmark_xirr_matches_year_long_total_return(self):
+        md = market(
+            {"QQQM": {"2025-01-02": 100, "2025-07-01": 100, "2026-01-02": 110}},
+            dividends={"QQQM": {"2025-07-01": 2.0}},
+            basis_end="2026-01-02",
+        )
+        result = simulate_benchmark(
+            "QQQM", pd.DataFrame(), 100.0, pd.Timestamp("2025-01-02"), pd.Timestamp("2026-01-02"), md
+        )
+
+        self.assertClose(result.end_value, 112.2)
+        self.assertClose(result.dividends_reinvested, 2.0)
+        self.assertClose(result.xirr_rate, 0.122)
+        self.assertClose(result.twr_total, 0.122)
+        self.assertClose(result.twr_annualized, 0.122)
+        self.assertEqual(result.warnings, [])
+
+    def test_benchmark_split_adjusts_shares(self):
+        md = market(
+            {"QQQM": {"2025-01-02": 100, "2025-01-03": 50}},
+            splits={"QQQM": {"2025-01-03": 2.0}},
+            basis_end="2025-01-03",
+        )
+        result = simulate_benchmark(
+            "QQQM", pd.DataFrame(), 100.0, pd.Timestamp("2025-01-02"), pd.Timestamp("2025-01-03"), md
+        )
+
+        self.assertClose(result.shares_end, 2.0)
+        self.assertClose(result.end_value, 100.0)
+        self.assertClose(result.twr_total, 0.0)
+        splits = [event for event in result.events if event.kind == "split"]
+        self.assertEqual(len(splits), 1)
+        self.assertClose(splits[0].shares, 2.0)
+
+    def test_benchmark_buys_on_ex_date_do_not_receive_dividend(self):
+        md = market(
+            {"QQQM": {"2025-01-06": 100, "2025-01-07": 100}},
+            dividends={"QQQM": {"2025-01-06": 1.0}},
+            basis_end="2025-01-07",
+        )
+        result = simulate_benchmark(
+            "QQQM", pd.DataFrame(), 100.0, pd.Timestamp("2025-01-06"), pd.Timestamp("2025-01-07"), md
+        )
+
+        self.assertClose(result.shares_end, 1.0)
+        self.assertClose(result.dividends_reinvested, 0.0)
+        self.assertEqual(result.dividend_count, 0)
+        self.assertClose(result.end_value, 100.0)
+
+    def test_benchmark_warns_when_no_dividends_in_long_period(self):
+        md = market({"QQQM": {"2025-01-02": 100, "2025-06-02": 100}}, basis_end="2025-06-02")
+        result = simulate_benchmark(
+            "QQQM", pd.DataFrame(), 100.0, pd.Timestamp("2025-01-02"), pd.Timestamp("2025-06-02"), md
+        )
+
+        self.assertTrue(result.warnings)
+        self.assertIn("dividend", result.warnings[0])
+        self.assertClose(result.end_value, 100.0)
+
+    def test_benchmark_rejects_periods_before_history(self):
+        md = market({"QQQM": {"2025-06-02": 50}}, basis_end="2025-06-02")
+        with self.assertRaises(PerformanceError):
+            simulate_benchmark(
+                "QQQM", pd.DataFrame(), 100.0, pd.Timestamp("2025-01-02"), pd.Timestamp("2025-06-02"), md
+            )
+
+    def test_benchmark_rejects_flows_outside_period(self):
+        md = market({"QQQM": {"2025-01-02": 100, "2025-01-03": 100}}, basis_end="2025-01-03")
+        flows = pd.DataFrame([{"Run Date": pd.Timestamp("2025-01-02"), "Amount": 100.0}])
+        with self.assertRaises(PerformanceError):
+            simulate_benchmark(
+                "QQQM", flows, 100.0, pd.Timestamp("2025-01-02"), pd.Timestamp("2025-01-03"), md
+            )
+
+    def test_download_market_data_extracts_dividend_events(self):
+        clear_yahoo_download_cache()
+        index = pd.to_datetime(["2026-01-02", "2026-01-03"])
+        columns = pd.MultiIndex.from_product([["Close", "Dividends", "Stock Splits"], ["QQQM"]])
+        data = pd.DataFrame(
+            [[100.0, 0.0, 0.0], [101.0, 0.5, 0.0]],
+            index=index,
+            columns=columns,
+        )
+
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                with patch("performance_core.yf.download", return_value=data.copy()):
+                    md = download_market_data(
+                        ["QQQM"], pd.Timestamp("2026-01-01"), pd.Timestamp("2026-01-03"), cache_dir=tmp
+                    )
+
+            self.assertClose(md.prices.loc[pd.Timestamp("2026-01-03"), "QQQM"], 101.0)
+            self.assertClose(md.dividends.loc[pd.Timestamp("2026-01-03"), "QQQM"], 0.5)
+            self.assertEqual(len(md.dividends), 1)
         finally:
             clear_yahoo_download_cache()
 

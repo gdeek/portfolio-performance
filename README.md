@@ -12,6 +12,7 @@ Future plans include a UI and support for other brokerages, including Robinhood.
 - Reconstructs holdings and cash balances from transaction history.
 - Handles SPAXX/core cash, free cash, external contributions, withdrawals, dividends, reinvestments, and stock splits.
 - Calculates XIRR and date-level approximate time-weighted CAGR.
+- Compares results against a benchmark (QQQM by default) by mirroring external cash flows and reinvesting benchmark dividends, with support for additional tickers.
 - Stops with clear errors when unsupported cash movements or corporate actions could make results unreliable.
 
 ## How to use
@@ -82,7 +83,25 @@ You can also validate calculated quantities against a Fidelity holdings CSV:
 python account_performance.py Accounts_History_20250110_20260430.csv YOUR_ACCOUNT_NUMBER 1Y --holdings-csv Holdings.csv
 ```
 
-### 7. Run tests
+### 7. Compare against a benchmark
+
+Every report includes a QQQM comparison by default. It replays the same external cash flows (start-of-period value plus every contribution and withdrawal) into the benchmark, reinvests benchmark dividends, and reports the same P/L %, XIRR, and TWR CAGR next to the portfolio's.
+
+Add more tickers by repeating `--benchmark`:
+
+```bash
+python account_performance.py Accounts_History_20250110_20260430.csv YOUR_ACCOUNT_NUMBER 1Y --benchmark QQQM --benchmark SPY
+```
+
+Skip the comparison:
+
+```bash
+python account_performance.py Accounts_History_20250110_20260430.csv YOUR_ACCOUNT_NUMBER 1Y --no-benchmark
+```
+
+Use `--details` to list each reinvested dividend with its ex-date, per-share amount, and shares added.
+
+### 8. Run tests
 
 ```bash
 python -m unittest -q
@@ -93,3 +112,5 @@ python -m unittest -q
 - Keep brokerage exports private. This repo ignores `Account*` files and all `*.csv` files by default.
 - The performance script assumes the transaction CSV is complete from account inception through the end date.
 - TWR is date-level approximate because Fidelity CSV exports do not provide intraday flow timing.
+- Benchmark comparisons mirror external cash flows at the next trading day's close, reinvest dividends at the ex-dividend close (Yahoo does not expose payable dates), and assume fractional shares with no fees or taxes.
+- The benchmark starts with the portfolio's start-of-period value, so comparisons stay apples-to-apples for periods like YTD or 1Y.

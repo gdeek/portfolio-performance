@@ -144,6 +144,7 @@ class MarketData:
     prices: pd.DataFrame
     splits: pd.DataFrame
     basis_end: pd.Timestamp
+    dividends: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 @dataclass
@@ -569,6 +570,7 @@ def download_market_data(
     end_dl = basis_end + timedelta(days=1)
     all_prices: dict[str, pd.Series] = {}
     all_splits: dict[str, pd.Series] = {}
+    all_dividends: dict[str, pd.Series] = {}
 
     for sym in symbols:
         last_err = None
@@ -600,6 +602,15 @@ def download_market_data(
                 split = split[split != 0.0]
                 split.name = sym
                 all_splits[sym] = split
+
+                dividend = extract_yfinance_series(data, "Dividends", sym)
+                if dividend is None:
+                    dividend = pd.Series(dtype=float)
+                dividend = pd.to_numeric(dividend, errors="coerce").fillna(0.0)
+                dividend.index = pd.to_datetime(dividend.index).normalize()
+                dividend = dividend[dividend > 0.0]
+                dividend.name = sym
+                all_dividends[sym] = dividend
                 break
             except Exception as exc:  # pragma: no cover - network/library failures vary.
                 last_err = exc
@@ -610,7 +621,12 @@ def download_market_data(
     splits = pd.concat(all_splits.values(), axis=1).sort_index() if all_splits else pd.DataFrame()
     if not splits.empty:
         splits = splits.fillna(0.0)
-    return MarketData(prices=prices, splits=splits, basis_end=basis_end)
+    dividends = (
+        pd.concat(all_dividends.values(), axis=1).sort_index() if all_dividends else pd.DataFrame()
+    )
+    if not dividends.empty:
+        dividends = dividends.fillna(0.0)
+    return MarketData(prices=prices, splits=splits, basis_end=basis_end, dividends=dividends)
 
 
 def get_price(market_data: MarketData, symbol: str, date: pd.Timestamp) -> float:
@@ -1042,18 +1058,16 @@ def total_value_series(df: pd.DataFrame, market_data: MarketData, dates: pd.Date
     return security_value + spaxx_value + free_cash
 
 
-def compute_twr(
-    df: pd.DataFrame,
-    market_data: MarketData,
+def chain_daily_returns(
+    values: pd.Series,
+    flows: pd.DataFrame,
     start: pd.Timestamp,
     end: pd.Timestamp,
-    flows: pd.DataFrame,
 ) -> tuple[float, float]:
     if start >= end:
         return float("nan"), float("nan")
 
     flow_by_date = flows.groupby("Run Date")["Amount"].sum() if not flows.empty else pd.Series(dtype=float)
-    values = total_value_series(df, market_data, pd.date_range(start, end, freq="D"))
     prev_value = float(values.loc[start.normalize()])
     chain = 1.0
 
@@ -1071,6 +1085,20 @@ def compute_twr(
     years = (end - start).days / 365.0
     annualized = chain ** (1.0 / years) - 1.0 if years > 0 and chain > 0 else float("nan")
     return total_return, annualized
+
+
+def compute_twr(
+    df: pd.DataFrame,
+    market_data: MarketData,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    flows: pd.DataFrame,
+) -> tuple[float, float]:
+    if start >= end:
+        return float("nan"), float("nan")
+
+    values = total_value_series(df, market_data, pd.date_range(start, end, freq="D"))
+    return chain_daily_returns(values, flows, start, end)
 
 
 def validation_ok(diff: float, expected: float) -> bool:
